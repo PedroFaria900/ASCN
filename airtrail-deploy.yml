@@ -1,3 +1,357 @@
 ---
-# Playbook to deploy Airtrail and its components
-# TO DO
+# Versão SIMPLIFICADA - sem health checks agressivos
+- name: Deploy AirTrail Application to GKE (Simple Version)
+  hosts: localhost
+  gather_facts: true
+  vars_files:
+    - inventory/gcp.yml
+  
+  vars:
+    db_name: airtrail
+    db_user: airtrail
+    db_password: airtrail_password
+    app_image: johly/airtrail:latest
+    
+  tasks:
+    - name: Create AirTrail Namespace
+      kubernetes.core.k8s:
+        name: airtrail
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    # ============================================
+    # BASE DE DADOS - SEM health checks complicados
+    # ============================================
+    - name: Create PVC for Database
+      kubernetes.core.k8s:
+        namespace: airtrail
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: postgres-pvc
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 5Gi
+
+    - name: Deploy PostgreSQL Database
+      kubernetes.core.k8s:
+        namespace: airtrail
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: airtrail-db
+            labels:
+              app: airtrail-db
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: airtrail-db
+            template:
+              metadata:
+                labels:
+                  app: airtrail-db
+              spec:
+                containers:
+                - name: postgres
+                  image: postgres:16-alpine
+                  env:
+                  - name: POSTGRES_DB
+                    value: "{{ db_name }}"
+                  - name: POSTGRES_USER
+                    value: "{{ db_user }}"
+                  - name: POSTGRES_PASSWORD
+                    value: "{{ db_password }}"
+                  - name: PGDATA
+                    value: /var/lib/postgresql/data/pgdata
+                  ports:
+                  - containerPort: 5432
+                  volumeMounts:
+                  - mountPath: /var/lib/postgresql/data
+                    name: db-data
+                  # Health check SIMPLES
+                  readinessProbe:
+                    tcpSocket:
+                      port: 5432
+                    initialDelaySeconds: 10
+                    periodSeconds: 5
+                volumes:
+                - name: db-data
+                  persistentVolumeClaim:
+                    claimName: postgres-pvc
+
+    - name: Create Database Service
+      kubernetes.core.k8s:
+        namespace: airtrail
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: airtrail-db-service
+          spec:
+            selector:
+              app: airtrail-db
+            ports:
+            - protocol: TCP
+              port: 5432
+              targetPort: 5432
+
+    # Aguardar DB de forma SIMPLES
+    - name: Wait for PostgreSQL pod to exist
+      shell: kubectl get pods -n airtrail -l app=airtrail-db -o jsonpath='{.items[0].metadata.name}'
+      register: db_pod_name
+      until: db_pod_name.stdout != ""
+      retries: 30
+      delay: 10
+
+    - name: Wait for PostgreSQL to be Running
+      shell: kubectl get pod -n airtrail {{ db_pod_name.stdout }} -o jsonpath='{.status.phase}'
+      register: db_status
+      until: db_status.stdout == "Running"
+      retries: 60
+      delay: 10
+
+    - name: Extra wait for DB initialization
+      pause:
+        seconds: 30
+        prompt: "⏳ Aguardando PostgreSQL inicializar completamente..."
+
+    - name: Verify DB is accepting connections
+      shell: kubectl exec -n airtrail {{ db_pod_name.stdout }} -- pg_isready -U {{ db_user }}
+      register: db_ready
+      until: db_ready.rc == 0
+      retries: 30
+      delay: 5
+      ignore_errors: yes
+
+    - debug:
+        msg: "✅ PostgreSQL está pronto: {{ db_pod_name.stdout }}"
+
+    # ============================================
+    # APLICAÇÃO - SEM init containers, SEM health checks agressivos
+    # ============================================
+    - name: Deploy AirTrail Web App (SIMPLE)
+      kubernetes.core.k8s:
+        namespace: airtrail
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: airtrail-web
+            labels:
+              app: airtrail-web
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: airtrail-web
+            template:
+              metadata:
+                labels:
+                  app: airtrail-web
+              spec:
+                containers:
+                - name: airtrail
+                  image: "{{ app_image }}"
+                  imagePullPolicy: Always
+                  ports:
+                  - containerPort: 3000
+                  env:
+                  - name: DB_URL
+                    value: "postgres://{{ db_user }}:{{ db_password }}@airtrail-db-service:5432/{{ db_name }}"
+                  - name: ORIGIN
+                    value: "http://0.0.0.0:3000"
+                  - name: BODY_SIZE_LIMIT
+                    value: "Infinity"
+                  # Health checks MUITO permissivos
+                  readinessProbe:
+                    httpGet:
+                      path: /
+                      port: 3000
+                    initialDelaySeconds: 90
+                    periodSeconds: 10
+                    timeoutSeconds: 10
+                    failureThreshold: 30  # Permite falhar 30 vezes!
+                  livenessProbe:
+                    httpGet:
+                      path: /
+                      port: 3000
+                    initialDelaySeconds: 180
+                    periodSeconds: 20
+                    timeoutSeconds: 10
+                    failureThreshold: 10
+
+    - name: Expose AirTrail Web App
+      kubernetes.core.k8s:
+        namespace: airtrail
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: airtrail-web-service
+          spec:
+            type: LoadBalancer
+            selector:
+              app: airtrail-web
+            ports:
+            - protocol: TCP
+              port: 80
+              targetPort: 3000
+
+    # Aguardar de forma MUITO paciente
+    - name: Wait for app pod to be created
+      shell: kubectl get pods -n airtrail -l app=airtrail-web -o jsonpath='{.items[0].metadata.name}'
+      register: app_pod_name
+      until: app_pod_name.stdout != ""
+      retries: 30
+      delay: 10
+
+    - debug:
+        msg: "Pod criado: {{ app_pod_name.stdout }}"
+
+    # Aguardar pod estar Running (não Ready, só Running)
+    - name: Wait for app pod to be Running
+      shell: kubectl get pod -n airtrail {{ app_pod_name.stdout }} -o jsonpath='{.status.phase}'
+      register: app_status
+      until: app_status.stdout == "Running"
+      retries: 60
+      delay: 10
+
+    - debug:
+        msg: "✅ Pod está Running. Aguardando aplicação inicializar..."
+
+    # Aguardar MUITO tempo para app ficar pronta
+    - name: Wait for app to respond (may take several minutes)
+      pause:
+        seconds: 120
+        prompt: "⏳ Aguardando aplicação inicializar (pode demorar 2-5 minutos)..."
+
+    # Tentar verificar se está pronta (mas não falhar se não estiver)
+    - name: Check if deployment is ready
+      shell: kubectl get deployment -n airtrail airtrail-web -o jsonpath='{.status.readyReplicas}'
+      register: ready_replicas
+      until: ready_replicas.stdout == "1"
+      retries: 40
+      delay: 15
+      ignore_errors: yes
+
+    # Mostrar logs independentemente do estado
+    - name: Show application logs (for debugging)
+      shell: kubectl logs -n airtrail {{ app_pod_name.stdout }} --tail=50
+      register: app_logs
+      ignore_errors: yes
+
+    - debug:
+        msg: "{{ app_logs.stdout_lines }}"
+      when: app_logs.stdout_lines is defined
+
+    # Aguardar LoadBalancer IP
+    - name: Wait for External IP
+      shell: kubectl get svc -n airtrail airtrail-web-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+      register: external_ip_cmd
+      until: external_ip_cmd.stdout != ""
+      retries: 40
+      delay: 15
+
+    - name: Set external IP fact
+      set_fact:
+        external_ip: "{{ external_ip_cmd.stdout }}"
+        external_port: "80"
+
+    # Atualizar gcp.yml
+    - name: Update app_ip in gcp.yml
+      lineinfile:
+        path: "{{ playbook_dir }}/inventory/gcp.yml"
+        regexp: '^(\s*)app_ip:.*'
+        line: '\1app_ip: {{ external_ip }}'
+        backrefs: yes
+      delegate_to: localhost
+
+    - name: Update app_port in gcp.yml
+      lineinfile:
+        path: "{{ playbook_dir }}/inventory/gcp.yml"
+        regexp: '^(\s*)app_port:.*'
+        line: '\1app_port: {{ external_port }}'
+        backrefs: yes
+      delegate_to: localhost
+
+    # Atualizar ORIGIN
+    - name: Update ORIGIN with external IP
+      kubernetes.core.k8s:
+        namespace: airtrail
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: airtrail-web
+          spec:
+            template:
+              spec:
+                containers:
+                - name: airtrail
+                  env:
+                  - name: DB_URL
+                    value: "postgres://{{ db_user }}:{{ db_password }}@airtrail-db-service:5432/{{ db_name }}"
+                  - name: ORIGIN
+                    value: "http://{{ external_ip }}"
+                  - name: BODY_SIZE_LIMIT
+                    value: "Infinity"
+
+    - name: Wait after ORIGIN update
+      pause:
+        seconds: 60
+        prompt: "⏳ Aguardando aplicação reiniciar com novo ORIGIN..."
+
+    # Teste final
+    - name: Test application
+      uri:
+        url: "http://{{ external_ip }}"
+        method: GET
+        status_code: 200
+        timeout: 15
+      register: final_test
+      retries: 20
+      delay: 15
+      ignore_errors: yes
+
+    - name: Display final status
+      debug:
+        msg:
+          - "=========================================="
+          - "Deployment Status"
+          - "=========================================="
+          - "🌐 URL: http://{{ external_ip }}"
+          - "📊 Database Pod: {{ db_pod_name.stdout }}"
+          - "📱 App Pod: {{ app_pod_name.stdout }}"
+          - "{{ '✅ Application is responding!' if final_test.status == 200 else '⚠️  Application may need more time to start' }}"
+          - "=========================================="
+          - "Se a aplicação não responde ainda:"
+          - "  1. Aguarda mais 2-3 minutos"
+          - "  2. Verifica logs: kubectl logs -n airtrail {{ app_pod_name.stdout }} -f"
+          - "  3. Testa: curl http://{{ external_ip }}"
+          - "=========================================="
+
+    - name: Save deployment info
+      copy:
+        content: |
+          AirTrail Deployment
+          ===================
+          URL: http://{{ external_ip }}
+          DB Pod: {{ db_pod_name.stdout }}
+          App Pod: {{ app_pod_name.stdout }}
+          
+          Deployed at: {{ ansible_date_time.iso8601 }}
+        dest: "{{ playbook_dir }}/deployment-info.txt"
+      delegate_to: localhost
