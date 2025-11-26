@@ -1,0 +1,70 @@
+---
+- name: Undeploy AirTrail from GKE
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - inventory/gcp.yml
+
+  tasks:
+    - name: Delete AirTrail app deployment
+    # App deployment
+      kubernetes.core.k8s:
+        namespace: airtrail
+        api_version: apps/v1
+        kind: Deployment
+        name: airtrail-web
+        state: absent
+      ignore_errors: yes
+      tags: ["undeploy", "app"]
+
+    - name: Delete AirTrail app service
+      kubernetes.core.k8s:
+        namespace: airtrail
+        api_version: v1
+        kind: Service
+        name: airtrail-web-service
+        state: absent
+      ignore_errors: yes
+      tags: ["undeploy", "app"]
+
+    - name: Delete PostgreSQL deployment
+      kubernetes.core.k8s:
+        namespace: airtrail
+        api_version: apps/v1
+        kind: Deployment
+        name: airtrail-db
+        state: absent
+      ignore_errors: yes
+      tags: ["undeploy", "db"]
+
+    - name: Delete PostgreSQL service
+      kubernetes.core.k8s:
+        namespace: airtrail
+        api_version: v1
+        kind: Service
+        name: airtrail-db-service
+        state: absent
+      ignore_errors: yes
+      tags: ["undeploy", "db"]
+
+    - name: Delete PostgreSQL PVC (only when delete_data is true)
+      kubernetes.core.k8s:
+        namespace: airtrail
+        api_version: v1
+        kind: PersistentVolumeClaim
+        name: postgres-pvc
+        state: absent
+      when: delete_data | default(false) | bool
+      ignore_errors: yes
+      tags: ["undeploy", "db", "delete_data"]
+
+    - name: Delete AirTrail namespace (only when delete_data is true)
+      kubernetes.core.k8s:
+        api_version: v1
+        kind: Namespace
+        name: airtrail
+        state: absent
+      when: delete_data | default(false) | bool
+      ignore_errors: yes
+      tags: ["undeploy", "delete_data"]
+

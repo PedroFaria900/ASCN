@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airtrail-web
+  namespace: airtrail
+  labels:
+    app: airtrail-web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: airtrail-web
+  template:
+    metadata:
+      labels:
+        app: airtrail-web
+    spec:
+      containers:
+        - name: airtrail
+          image: "{{ app_image }}"
+          env:
+            - name: PORT
+              value: "3000"
+            - name: DB_URL
+              value: "postgres://{{ db_user }}:{{ db_password }}@airtrail-db-service:5432/{{ db_name }}"
+            - name: ORIGIN
+              value: "http://0.0.0.0:3000"
+          ports:
+            - containerPort: 3000
+

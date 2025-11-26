@@ -1,0 +1,59 @@
+---
+- name: Deploy AirTrail application
+  kubernetes.core.k8s:
+    state: present
+    definition: "{{ lookup('template', 'airtrail-deployment.yml') | from_yaml }}"
+    wait: true
+    wait_timeout: 300
+  tags: ["app", "deployment"]
+
+- name: Create AirTrail service
+  kubernetes.core.k8s:
+    state: present
+    definition: "{{ lookup('template', 'airtrail-service.yml') | from_yaml }}"
+    wait: true
+  tags: ["app", "service"]
+
+- name: Wait for AirTrail service external IP
+  ansible.builtin.command:
+    cmd: >
+      kubectl get svc -n airtrail airtrail-web-service
+      -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+  register: external_ip_cmd
+  retries: 10
+  delay: 15
+  until: external_ip_cmd.stdout != ""
+  changed_when: false
+  tags: ["app", "service", "ip"]
+
+- name: Set app_ip and app_port facts
+  ansible.builtin.set_fact:
+    external_ip: "{{ external_ip_cmd.stdout }}"
+    external_port: "80"
+  tags: ["app", "ip"]
+
+- name: Update app_ip in inventory
+  ansible.builtin.lineinfile:
+    path: "{{ playbook_dir }}/inventory/gcp.yml"
+    regexp: '^(\s*)app_ip:.*'
+    line: '\1app_ip: {{ external_ip }}'
+    backrefs: yes
+  tags: ["app", "ip"]
+
+- name: Update app_port in inventory
+  ansible.builtin.lineinfile:
+    path: "{{ playbook_dir }}/inventory/gcp.yml"
+    regexp: '^(\s*)app_port:.*'
+    line: '\1app_port: {{ external_port }}'
+    backrefs: yes
+  tags: ["app", "ip"]
+
+- name: Patch ORIGIN env var with real external IP
+  ansible.builtin.command:
+    cmd: >
+      kubectl set env deployment/airtrail-web
+      -n airtrail
+      ORIGIN=http://{{ external_ip }}:{{ external_port }}
+  changed_when: true
+  tags: ["app", "origin"]
+
